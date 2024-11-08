@@ -98,7 +98,7 @@ def mostrar_dispositivos_gui(rango_red):
     controls_frame = ttk.Frame(main_frame)
     controls_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
     ttk.Button(controls_frame, text="Escanear Red", command=lambda: threading.Thread(target=actualizar_dispositivos, daemon=True).start()).grid(row=0, column=0, padx=5)
-    ttk.Button(controls_frame, text="Generar Reporte", command=lambda: messagebox.showinfo("Info", "Generación de reportes no implementada aún.")).grid(row=0, column=1, padx=5)
+    ttk.Button(controls_frame, text="Generar Reporte", command=lambda: generar_reporte()).grid(row=0, column=1, padx=5)
 
     # Frame izquierdo para dispositivos detectados
     left_frame = ttk.LabelFrame(main_frame, text="Dispositivos Detectados", padding="5")
@@ -246,6 +246,64 @@ def mostrar_dispositivos_gui(rango_red):
             blocked_tree.delete(item)
         for dispositivo in dispositivos_bloqueados.values():
             blocked_tree.insert('', tk.END, values=(dispositivo['ip'], dispositivo['mac'], dispositivo['ttl'], dispositivo['os'], dispositivo['last_seen']))
+
+    # Función para generar el reporte en PDF
+    def generar_reporte():
+        try:
+            # Definir el nombre del archivo PDF
+            reporte_pdf = f"reporte_dispositivos_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+            doc = SimpleDocTemplate(reporte_pdf, pagesize=letter)
+            elements = []
+
+            # Título del reporte
+            styles = getSampleStyleSheet()
+            elements.append(Paragraph("Reporte de Dispositivos de Red", styles['Title']))
+
+            # Tabla de dispositivos detectados
+            elementos_detectados = [["Dirección IP", "Dirección MAC", "TTL", "Sistema Operativo", "Última Conexión"]]
+            for dispositivo in dispositivos_actuales.values():
+                elementos_detectados.append([dispositivo['ip'], dispositivo['mac'], dispositivo['ttl'], dispositivo['os'], dispositivo['last_seen']])
+
+            tabla_detectados = Table(elementos_detectados)
+            tabla_detectados.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ]))
+
+            elements.append(Paragraph("<b>Dispositivos Permitidos</b>", styles['Heading2']))
+            elements.append(tabla_detectados)
+
+            # Tabla de dispositivos bloqueados
+            elementos_bloqueados = [["Dirección IP", "Dirección MAC", "TTL", "Sistema Operativo", "Última Conexión"]]
+            for dispositivo in dispositivos_bloqueados.values():
+                elementos_bloqueados.append([dispositivo['ip'], dispositivo['mac'], dispositivo['ttl'], dispositivo['os'], dispositivo['last_seen']])
+
+            tabla_bloqueados = Table(elementos_bloqueados)
+            tabla_bloqueados.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.lightpink),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ]))
+
+            elements.append(Paragraph("<b>Dispositivos Bloqueados</b>", styles['Heading2']))
+            elements.append(tabla_bloqueados)
+
+            # Construir el PDF
+            doc.build(elements)
+            messagebox.showinfo("Éxito", f"Reporte generado exitosamente: {reporte_pdf}")
+            log_text.insert(tk.END, f"Reporte generado: {reporte_pdf}\n")
+        except Exception as e:
+            messagebox.showerror("Error", f"Error al generar el reporte: {e}")
+            log_text.insert(tk.END, f"Error al generar el reporte: {e}\n")
 
     # Botones para bloquear y desbloquear dispositivos
     ttk.Button(controls_frame, text="Bloquear Seleccionado", command=bloquear_dispositivo_seleccionado).grid(row=0, column=2, padx=5)
