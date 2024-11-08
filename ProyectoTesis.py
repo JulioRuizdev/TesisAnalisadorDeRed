@@ -13,6 +13,8 @@ from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
 from reportlab.lib.styles import getSampleStyleSheet
 import json
+from pystray import Icon, Menu, MenuItem
+from PIL import Image
 
 def obtener_dispositivos_red(rango_red):
     # Construir un paquete ARP para escanear la red
@@ -312,6 +314,16 @@ def mostrar_dispositivos_gui(rango_red):
     # Ejecutar el escaneo en un hilo separado para no bloquear la interfaz
     hilo_escaneo = threading.Thread(target=actualizar_dispositivos, daemon=True)
     hilo_escaneo.start()
+
+    # Iniciar el ícono de la bandeja del sistema
+    def iniciar_tray_icon():
+        icon_image = Image.open("app.ico")  # Debes proporcionar un ícono
+        menu = Menu(MenuItem("Salir", lambda icon, item: icon.stop()))
+        tray_icon = Icon("NetworkAnalyzer", icon_image, menu=menu)
+        tray_icon.run()
+
+    hilo_tray = threading.Thread(target=iniciar_tray_icon, daemon=True)
+    hilo_tray.start()
 
     root.mainloop()
 
